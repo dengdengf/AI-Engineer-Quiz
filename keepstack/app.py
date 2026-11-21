@@ -18,7 +18,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                PlainTextResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, ingest, search, standards, storage, thumbnails
+from . import __version__, csv_export, ingest, search, standards, storage, thumbnails
 from .audit import log, now_iso
 from .auth import (authenticate, hash_password, login_locked, make_token,
                    note_login_failure, note_login_success, role_at_least,
@@ -173,21 +173,76 @@ async def upload_assets(
     return {"created": results}
 
 
+def _filter_kwargs(
+    q: str,
+    media_type: Optional[str],
+    tag: Optional[str],
+    include_tags: list[str],
+    exclude_tags: list[str],
+    collection_id: Optional[int],
+    status: str,
+    sort: str,
+) -> dict:
+    """One place that maps HTTP query params to search kwargs.
+
+    Both the paged list and the CSV export call this, so the two can never
+    drift on which filters or sort are applied.
+    """
+    return dict(
+        q=q, media_type=media_type, tag=tag, include_tags=include_tags,
+        exclude_tags=exclude_tags, collection_id=collection_id,
+        status=status, sort=sort,
+    )
+
+
 @app.get("/api/assets")
 def list_assets(
     q: str = "",
     media_type: Optional[str] = None,
     tag: Optional[str] = None,
+    include_tags: list[str] = Query(default=[]),
+    exclude_tags: list[str] = Query(default=[]),
     collection_id: Optional[int] = None,
     status: str = "active",
     sort: str = "newest",
     mode: str = "keyword",
-    limit: int = Query(60, le=200),
+    limit: int = 60,
     offset: int = 0,
     user: dict = Depends(require_user),
 ):
-    return search.search(q=q, media_type=media_type, tag=tag, collection_id=collection_id,
-                         status=status, sort=sort, mode=mode, limit=limit, offset=offset)
+    kwargs = _filter_kwargs(q, media_type, tag, include_tags, exclude_tags,
+                            collection_id, status, sort)
+    return search.search(mode=mode, limit=limit, offset=offset, **kwargs)
+
+
+@app.get("/api/assets/export.csv")
+def export_assets_csv(
+    request: Request,
+    q: str = "",
+    media_type: Optional[str] = None,
+    tag: Optional[str] = None,
+    include_tags: list[str] = Query(default=[]),
+    exclude_tags: list[str] = Query(default=[]),
+    collection_id: Optional[int] = None,
+    status: str = "active",
+    sort: str = "newest",
+    user: dict = Depends(require_user),
+):
+    """Export every matching asset as CSV, ignoring the page window.
+
+    Auth is the same Bearer token as the rest of the API (the browser client
+    fetches it and triggers a blob download). No asset files are included.
+    """
+    kwargs = _filter_kwargs(q, media_type, tag, include_tags, exclude_tags,
+                            collection_id, status, sort)
+    rows = search.search_all(**kwargs)
+    body = csv_export.rows_to_csv(rows)
+    log("asset.export", user=user, detail=f"{len(rows)} rows", ip=client_ip(request))
+    return Response(
+        content=body.encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="assets.csv"'},
+    )
 
 
 def _get_asset_or_404(uuid: str) -> dict:
