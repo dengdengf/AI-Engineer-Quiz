@@ -74,9 +74,13 @@ uv run --no-sync python -m pytest -q
 - 7 个反例：带 `internal`、缺 `campaign`、缺 `approved`、在其他集合、已删除、无关键词、音频类型；
 - 期望命中数固定为 8，测试通过 `build_dataset()` 返回的 `info` 断言，不硬编码数据库 id。
 
-### 自动化测试覆盖（`tests/test_quiz_features.py`，12 项）
+### 自动化测试覆盖（`tests/test_quiz_features.py`，18 项，逐条对应题目要求）
 
-组合筛选精确集、各条件单独生效、重复/冲突标签、空白关键词；每页 1/3/5/200 条无重复无遗漏与越界页；相同创建时间下排序稳定、关键词+排序遵守所选排序；导出与完整筛选排序列表逐条一致、不受分页窗口影响、CSV 列/转义/中文/零结果表头、媒体类型筛选、鉴权 401；经现有 API 改标签/标题后查询与导出同步；非法分页参数与注入样式输入。
+- **组合筛选**：精确命中集、各条件单独生效、标签完整名称匹配（非前缀/子串）、重复/大小写/冲突标签、空白关键词；集合筛选参数错位缺陷的回归。
+- **排序与分页**：每页 1/3/5/200 条无重复无遗漏与越界页；相同 `created_at` 下排序稳定、关键词+排序遵守所选排序；空结果优雅处理；非法分页参数、注入样式输入与非数字/未知 sort。
+- **CSV 导出**：与完整筛选排序列表逐条一致、不受分页窗口影响、必需列齐全、多标签 `|` 格式、中文/逗号/引号/换行转义、仅元数据无文件字段、零结果表头、媒体类型筛选、鉴权 401。
+- **修改后结果正确**：经现有 API 改标签、改标题、改描述后，下一次查询与导出均同步反映（三种字段各有独立测试）。
+- **前端行为**：筛选面板元素与生效条件展示/清除、分页与请求竞态保护、导出下载与失败提示的前端逻辑存在性检查。
 
 ## 4. 实测结果
 
@@ -84,7 +88,7 @@ uv run --no-sync python -m pytest -q
 
 - `python -m keepstack seed` → `Seeded 24 assets, 3 collections`
 - `python -m keepstack seed-quiz` → `Quiz dataset ready: 8 expected matches`
-- `python -m pytest -q` → **34 passed, 2 skipped**（2 项跳过为可选本地视觉模型 / tesseract，环境未安装）
+- `python -m pytest -q` → **40 passed, 2 skipped**（其中 `test_quiz_features.py` 18 项全通过；2 项跳过为可选本地视觉模型 / tesseract，环境未安装）
 - 真实服务（uvicorn，`127.0.0.1:8123`）冒烟：`/healthz` → `ok`；`POST /api/auth/login` → 200；带 token 的 `GET /api/assets/export.csv`（harbor + 集合 + 包含/排除标签 + oldest）→ **HTTP 200**，`content-type: text/csv; charset=utf-8`，CSV 首行为 `uuid,title,description,filename,media_type,tags,created_at`，首条数据为 `Harbor sunrise overview ... approved|campaign ... 2026-01-01T09:00:00Z`（按 oldest 升序排列，符合预期）。
 
 ## 5. 主要取舍
