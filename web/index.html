@@ -31,10 +31,6 @@
       </div>
       <div class="search-box">
         <input id="search" placeholder="Search assets, tags, metadata...">
-        <select id="search-mode" title="Search mode">
-          <option value="keyword">Keyword</option>
-          <option value="semantic">Semantic</option>
-        </select>
       </div>
       <div class="topbar-right">
         <button id="btn-upload" class="btn btn-primary">Upload</button>
@@ -72,17 +68,40 @@
           <div class="view-head">
             <h2 id="result-title">Library</h2>
             <div class="view-controls">
-              <span id="active-filter" class="chip hidden"></span>
-              <select id="sort">
-                <option value="newest">Newest</option>
-                <option value="oldest">Oldest</option>
+              <select id="sort" title="Sort order">
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
                 <option value="name">Name</option>
                 <option value="largest">Largest</option>
               </select>
+              <button id="btn-export" class="btn" title="Export all matching assets to CSV">Export CSV</button>
             </div>
           </div>
+
+          <!-- Combined filters -->
+          <div class="filter-bar">
+            <label>Collection
+              <select id="filter-collection"><option value="">All collections</option></select>
+            </label>
+            <label>Include tags <span class="hint">(all)</span>
+              <input id="filter-include" placeholder="approved, campaign">
+            </label>
+            <label>Exclude tags <span class="hint">(any)</span>
+              <input id="filter-exclude" placeholder="internal">
+            </label>
+            <button id="btn-apply-filter" class="btn btn-primary">Apply</button>
+            <button id="btn-clear-filter" class="btn btn-ghost">Clear</button>
+          </div>
+          <div id="active-filters" class="active-filters hidden"></div>
+
           <div id="grid" class="grid"></div>
           <div id="empty" class="empty hidden">No assets yet. Click Upload to get started.</div>
+
+          <div class="pager">
+            <button id="page-prev" class="btn">← Previous</button>
+            <span id="page-info" class="muted"></span>
+            <button id="page-next" class="btn">Next →</button>
+          </div>
         </div>
 
         <div id="view-collections" class="view hidden">

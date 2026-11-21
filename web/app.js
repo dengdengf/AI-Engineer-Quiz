@@ -1,8 +1,14 @@
 /* Keepstack single-page client. Vanilla JS, no build step. */
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-const state = { token: localStorage.getItem("keepstack_token"), user: null,
-  q: "", mode: "keyword", media: null, tag: null, sort: "newest", collection: null };
+const PAGE_SIZE = 12;
+const state = {
+  token: localStorage.getItem("keepstack_token"), user: null,
+  q: "", media: null, tag: null, sort: "newest",
+  collection: "", include: [], exclude: [],
+  offset: 0, total: 0,
+  reqSeq: 0, // monotonically increasing id; only the newest request may render
+};
 
 // ---------- API helper ----------
 async function api(path, opts = {}) {
@@ -40,6 +46,7 @@ function enterApp() {
   $("#user-label").textContent = `${state.user.username} (${state.user.role})`;
   const isAdmin = state.user.role === "admin";
   $$(".admin-only").forEach(el => el.classList.toggle("hidden", !isAdmin));
+  loadCollectionOptions();
   loadLibrary();
 }
 
@@ -58,26 +65,77 @@ $$(".nav-item").forEach(btn => btn.addEventListener("click", () => {
 
 // ---------- library / search ----------
 let searchTimer;
-$("#search").addEventListener("input", (e) => { state.q = e.target.value; clearTimeout(searchTimer); searchTimer = setTimeout(loadLibrary, 250); });
-$("#search-mode").addEventListener("change", (e) => { state.mode = e.target.value; loadLibrary(); });
-$("#sort").addEventListener("change", (e) => { state.sort = e.target.value; loadLibrary(); });
-$("#active-filter").addEventListener("click", () => { state.media = null; state.tag = null; state.collection = null; loadLibrary(); });
+const splitTags = (s) => [...new Set((s || "").split(/[,\s]+/).map(t => t.trim().toLowerCase()).filter(Boolean))];
 
-async function loadLibrary() {
-  const p = new URLSearchParams({ q: state.q, sort: state.sort, mode: state.mode, limit: "120" });
+// Build the query string shared by the paged list and the CSV export so both
+// use exactly the same filters and sort.
+function buildParams({ withPage = true } = {}) {
+  const p = new URLSearchParams();
+  p.set("q", state.q);
+  p.set("sort", state.sort);
   if (state.media) p.set("media_type", state.media);
   if (state.tag) p.set("tag", state.tag);
   if (state.collection) p.set("collection_id", state.collection);
-  const data = await api("/api/assets?" + p.toString());
-  renderFacets(data.facets);
-  renderGrid(data.items, data.total);
-  const filt = state.media || (state.tag ? "#" + state.tag : null) || (state.collection ? "collection" : null);
-  $("#active-filter").classList.toggle("hidden", !filt);
-  if (filt) $("#active-filter").textContent = filt;
+  state.include.forEach(t => p.append("include_tags", t));
+  state.exclude.forEach(t => p.append("exclude_tags", t));
+  if (withPage) { p.set("limit", String(PAGE_SIZE)); p.set("offset", String(state.offset)); }
+  return p;
+}
+
+function resetPage() { state.offset = 0; }
+
+$("#search").addEventListener("input", (e) => {
+  state.q = e.target.value; resetPage();
+  clearTimeout(searchTimer); searchTimer = setTimeout(loadLibrary, 250);
+});
+$("#sort").addEventListener("change", (e) => { state.sort = e.target.value; resetPage(); loadLibrary(); });
+$("#btn-apply-filter").addEventListener("click", () => {
+  state.collection = $("#filter-collection").value;
+  state.include = splitTags($("#filter-include").value);
+  state.exclude = splitTags($("#filter-exclude").value);
+  resetPage(); loadLibrary();
+});
+$("#btn-clear-filter").addEventListener("click", () => {
+  state.q = ""; state.media = null; state.tag = null; state.collection = "";
+  state.include = []; state.exclude = [];
+  $("#search").value = ""; $("#filter-collection").value = "";
+  $("#filter-include").value = ""; $("#filter-exclude").value = "";
+  $("#sort").value = "newest"; state.sort = "newest";
+  resetPage(); loadLibrary();
+});
+$("#page-prev").addEventListener("click", () => {
+  state.offset = Math.max(0, state.offset - PAGE_SIZE); loadLibrary();
+});
+$("#page-next").addEventListener("click", () => {
+  if (state.offset + PAGE_SIZE < state.total) { state.offset += PAGE_SIZE; loadLibrary(); }
+});
+
+async function loadLibrary() {
+  const mySeq = ++state.reqSeq;               // tag this request
+  const params = buildParams();
+  try {
+    const data = await api("/api/assets?" + params.toString());
+    if (mySeq !== state.reqSeq) return;        // a newer request already fired: discard
+    state.total = data.total;
+    // If a filter shrink made the current offset invalid, snap back to page 1.
+    if (state.offset > 0 && state.offset >= data.total) { resetPage(); return loadLibrary(); }
+    renderFacets(data.facets);
+    renderGrid(data.items, data.total);
+    renderActiveFilters();
+    renderPager(data.total);
+  } catch (err) {
+    if (mySeq !== state.reqSeq) return;
+    $("#grid").innerHTML = "";
+    $("#empty").textContent = "Failed to load results: " + err.message;
+    $("#empty").classList.remove("hidden");
+    $("#page-info").textContent = "";
+    $("#page-prev").disabled = $("#page-next").disabled = true;
+  }
 }
 
 function renderGrid(items, total) {
   $("#result-title").textContent = state.q ? `Results (${total})` : `Library (${total})`;
+  $("#empty").textContent = "No matching assets. Adjust the filters or upload new assets.";
   $("#empty").classList.toggle("hidden", items.length > 0);
   $("#grid").innerHTML = items.map(a => `
     <div class="card" data-uuid="${a.uuid}">
@@ -90,13 +148,87 @@ function renderGrid(items, total) {
   $$("#grid .card").forEach(c => c.addEventListener("click", () => openAsset(c.dataset.uuid)));
 }
 
+function renderPager(total) {
+  const first = total === 0 ? 0 : state.offset + 1;
+  const last = Math.min(state.offset + PAGE_SIZE, total);
+  $("#page-info").textContent = `${first}–${last} of ${total}`;
+  $("#page-prev").disabled = state.offset === 0;
+  $("#page-next").disabled = state.offset + PAGE_SIZE >= total;
+}
+
+function renderActiveFilters() {
+  const box = $("#active-filters");
+  const chips = [];
+  if (state.q) chips.push(["Keyword", state.q, "q"]);
+  if (state.collection) chips.push(["Collection", $("#filter-collection").selectedOptions[0]?.textContent || state.collection, "collection"]);
+  if (state.media) chips.push(["Type", state.media, "media"]);
+  if (state.tag) chips.push(["Tag", "#" + state.tag, "tag"]);
+  state.include.forEach(t => chips.push(["Include", t, "include:" + t]));
+  state.exclude.forEach(t => chips.push(["Exclude", t, "exclude:" + t]));
+  box.innerHTML = chips.length
+    ? `<span class="label">Active filters:</span>` + chips.map(([k, v, key]) =>
+        `<span class="fchip" data-key="${esc(key)}" title="Click to remove">${esc(k)}: ${esc(v)}</span>`).join("")
+    : "";
+  box.classList.toggle("hidden", chips.length === 0);
+  $$("#active-filters .fchip").forEach(chip => chip.addEventListener("click", () => {
+    const key = chip.dataset.key;
+    if (key === "q") { state.q = ""; $("#search").value = ""; }
+    else if (key === "collection") { state.collection = ""; $("#filter-collection").value = ""; }
+    else if (key === "media") state.media = null;
+    else if (key === "tag") state.tag = null;
+    else if (key.startsWith("include:")) {
+      state.include = state.include.filter(t => t !== key.slice(8));
+      $("#filter-include").value = state.include.join(", ");
+    } else if (key.startsWith("exclude:")) {
+      state.exclude = state.exclude.filter(t => t !== key.slice(8));
+      $("#filter-exclude").value = state.exclude.join(", ");
+    }
+    resetPage(); loadLibrary();
+  }));
+}
+
 function renderFacets(facets) {
   $("#facet-media").innerHTML = (facets.media_types || []).map(m =>
     `<li class="${state.media===m.value?'active':''}" data-media="${m.value}"><span>${m.value}</span><span class="count">${m.count}</span></li>`).join("");
   $("#facet-tags").innerHTML = (facets.tags || []).slice(0, 18).map(t =>
     `<li class="${state.tag===t.value?'active':''}" data-tag="${esc(t.value)}"><span>${esc(t.value)}</span><span class="count">${t.count}</span></li>`).join("");
-  $$("#facet-media li").forEach(li => li.addEventListener("click", () => { state.media = state.media===li.dataset.media?null:li.dataset.media; loadLibrary(); }));
-  $$("#facet-tags li").forEach(li => li.addEventListener("click", () => { state.tag = state.tag===li.dataset.tag?null:li.dataset.tag; loadLibrary(); }));
+  $$("#facet-media li").forEach(li => li.addEventListener("click", () => { state.media = state.media===li.dataset.media?null:li.dataset.media; resetPage(); loadLibrary(); }));
+  $$("#facet-tags li").forEach(li => li.addEventListener("click", () => { state.tag = state.tag===li.dataset.tag?null:li.dataset.tag; resetPage(); loadLibrary(); }));
+}
+
+// ---------- CSV export ----------
+$("#btn-export").addEventListener("click", async () => {
+  const btn = $("#btn-export");
+  const params = buildParams({ withPage: false }); // export ALL matches, not just this page
+  const original = btn.textContent;
+  btn.disabled = true; btn.textContent = "Exporting…";
+  try {
+    const res = await fetch("/api/assets/export.csv?" + params.toString(), {
+      headers: { Authorization: "Bearer " + state.token },
+    });
+    if (res.status === 401) { logout(); throw new Error("unauthorised"); }
+    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "assets.csv";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast("CSV exported");
+  } catch (err) {
+    toast("Export failed: " + err.message, "err");
+  } finally {
+    btn.disabled = false; btn.textContent = original;
+  }
+});
+
+async function loadCollectionOptions() {
+  const data = await api("/api/collections");
+  const sel = $("#filter-collection");
+  const current = sel.value;
+  sel.innerHTML = `<option value="">All collections</option>` +
+    data.collections.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
+  sel.value = current;
 }
 
 // ---------- asset detail drawer ----------
@@ -229,6 +361,8 @@ async function loadCollections() {
     || '<p class="muted">No collections yet.</p>';
   $$("#collection-list .collection-card").forEach(card => card.addEventListener("click", () => {
     state.collection = card.dataset.id; state.media = null; state.tag = null;
+    $("#filter-collection").value = state.collection;
+    resetPage();
     $$(".nav-item").forEach(b => b.classList.remove("active"));
     $('.nav-item[data-view="library"]').classList.add("active");
     $$(".view").forEach(v => v.classList.add("hidden")); $("#view-library").classList.remove("hidden");
