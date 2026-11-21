@@ -17,6 +17,13 @@ def main() -> None:
         from .seed import run_seed
         run_seed()
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "seed-quiz":
+        from .quiz_data import build_dataset
+        info = build_dataset()
+        print(f"Quiz dataset ready: {info['expected_match_count']} expected matches "
+              f"in collection id {info['collection_id']}.")
+        print("Sign in as admin/admin.")
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "reindex":
         from . import vision
         from .db import get_conn, init_db

@@ -90,6 +90,11 @@ def _query_parts(
     where = ["a.status = ?"]
     params: list = [status]
     join = ""
+    # Placeholders inside JOIN ... ON appear BEFORE the WHERE placeholders in
+    # the final SQL text, so their bound values must be returned first. The
+    # original implementation appended the collection id last, which shifted
+    # every condition by one and made collection filtering match nothing.
+    join_params: list = []
 
     if q and q.strip():
         join += " JOIN asset_fts ON asset_fts.rowid = a.id"
@@ -132,13 +137,13 @@ def _query_parts(
         except (TypeError, ValueError):
             cid = 0  # an invalid collection simply matches nothing
         join += " JOIN collection_assets ca ON ca.asset_id = a.id AND ca.collection_id = ?"
-        params.append(cid)
+        join_params.append(cid)
 
     order = SORTS.get(sort, SORTS["newest"])
     # Relevance only has meaning when an FTS match is part of the query.
     if order.startswith("bm25") and not (q and q.strip()):
         order = SORTS["newest"]
-    return join, " AND ".join(where), params, order
+    return join, " AND ".join(where), [*join_params, *params], order
 
 
 def search(
