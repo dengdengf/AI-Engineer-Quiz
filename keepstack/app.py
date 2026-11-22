@@ -15,7 +15,7 @@ from typing import Optional
 from fastapi import (Body, Depends, FastAPI, File, Form, HTTPException, Query,
                      Request, UploadFile)
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               PlainTextResponse, Response)
+                               PlainTextResponse, Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, csv_export, ingest, search, standards, storage, thumbnails
@@ -195,6 +195,40 @@ def _filter_kwargs(
     )
 
 
+def _validate_asset_query(*, status="active", sort="newest", mode="keyword",
+                          tag=None, include_tags=None, exclude_tags=None,
+                          collection_id=None) -> None:
+    """Reject unsupported options instead of silently ignoring them."""
+    if status != "active":
+        raise HTTPException(400, "Only active assets are available")
+    if sort not in search.SORTS:
+        raise HTTPException(400, f"Unknown sort: {sort}")
+    if mode not in ("keyword", "semantic"):
+        raise HTTPException(400, f"Unknown mode: {mode}")
+    if mode == "semantic" and any((tag, include_tags, exclude_tags,
+                                   collection_id is not None)):
+        raise HTTPException(400, "Combined filters are not supported in semantic mode")
+
+
+def _filter_summary(q, media_type, tag, include_tags, exclude_tags, collection_id, sort) -> str:
+    """Short, stable summary of the applied filters for the export audit line."""
+    parts = []
+    if q and q.strip():
+        parts.append("q=" + q.strip()[:80])
+    if media_type:
+        parts.append("type=" + media_type)
+    if collection_id is not None:
+        parts.append("collection=" + str(collection_id))
+    if tag:
+        parts.append("tag=" + tag.lower())
+    if include_tags:
+        parts.append("include=" + ",".join(sorted({t.lower() for t in include_tags})))
+    if exclude_tags:
+        parts.append("exclude=" + ",".join(sorted({t.lower() for t in exclude_tags})))
+    parts.append("sort=" + sort)
+    return " ".join(parts)
+
+
 @app.get("/api/assets")
 def list_assets(
     q: str = "",
@@ -210,8 +244,11 @@ def list_assets(
     offset: int = 0,
     user: dict = Depends(require_user),
 ):
+    _validate_asset_query(status=status, sort=sort, mode=mode, tag=tag,
+                          include_tags=include_tags, exclude_tags=exclude_tags,
+                          collection_id=collection_id)
     kwargs = _filter_kwargs(q, media_type, tag, include_tags, exclude_tags,
-                            collection_id, status, sort)
+                            collection_id, "active", sort)
     return search.search(mode=mode, limit=limit, offset=offset, **kwargs)
 
 
@@ -228,18 +265,24 @@ def export_assets_csv(
     sort: str = "newest",
     user: dict = Depends(require_user),
 ):
-    """Export every matching asset as CSV, ignoring the page window.
+    """Export every matching active asset as CSV, ignoring the page window.
 
-    Auth is the same Bearer token as the rest of the API (the browser client
-    fetches it and triggers a blob download). No asset files are included.
+    Rows are streamed from a batched iterator so a large result set is never
+    fully materialised. Auth is the same Bearer token as the rest of the API;
+    no asset files are included.
     """
+    _validate_asset_query(status=status, sort=sort, tag=tag,
+                          include_tags=include_tags, exclude_tags=exclude_tags,
+                          collection_id=collection_id)
     kwargs = _filter_kwargs(q, media_type, tag, include_tags, exclude_tags,
-                            collection_id, status, sort)
-    rows = search.search_all(**kwargs)
-    body = csv_export.rows_to_csv(rows)
-    log("asset.export", user=user, detail=f"{len(rows)} rows", ip=client_ip(request))
-    return Response(
-        content=body.encode("utf-8"),
+                            collection_id, "active", sort)
+    total = search.count_matches(kwargs)
+    log("asset.export", user=user,
+        detail=f"{total} assets; " + _filter_summary(
+            q, media_type, tag, include_tags, exclude_tags, collection_id, sort),
+        ip=client_ip(request))
+    return StreamingResponse(
+        csv_export.iter_csv(search.iter_rows(kwargs)),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="assets.csv"'},
     )

@@ -72,6 +72,9 @@ CREATE INDEX IF NOT EXISTS idx_assets_sha    ON assets (sha256);
 CREATE INDEX IF NOT EXISTS idx_assets_status ON assets (status);
 CREATE INDEX IF NOT EXISTS idx_assets_media  ON assets (media_type);
 CREATE INDEX IF NOT EXISTS idx_assets_created ON assets (created_at);
+-- Combined-filter hot paths: created_at is sorted via julianday() to normalise
+-- ISO offsets (Z vs +00:00); the id keeps the order deterministic.
+CREATE INDEX IF NOT EXISTS idx_assets_created_jd ON assets (julianday(created_at), id);
 
 CREATE TABLE IF NOT EXISTS asset_metadata (
     asset_id  INTEGER PRIMARY KEY,
@@ -106,6 +109,8 @@ CREATE TABLE IF NOT EXISTS tags (
     name     TEXT UNIQUE NOT NULL,
     category TEXT
 );
+-- Tag names are matched case-insensitively by the combined-filter queries.
+CREATE INDEX IF NOT EXISTS idx_tags_lower_name ON tags (lower(name));
 
 CREATE TABLE IF NOT EXISTS asset_tags (
     asset_id   INTEGER NOT NULL,
@@ -116,6 +121,8 @@ CREATE TABLE IF NOT EXISTS asset_tags (
     FOREIGN KEY (asset_id) REFERENCES assets (id) ON DELETE CASCADE,
     FOREIGN KEY (tag_id)   REFERENCES tags (id)   ON DELETE CASCADE
 );
+-- EXISTS(tag) subqueries probe by tag_id -> asset_id.
+CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags (tag_id, asset_id);
 
 CREATE TABLE IF NOT EXISTS collections (
     id          INTEGER PRIMARY KEY,

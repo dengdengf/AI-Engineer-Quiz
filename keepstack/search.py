@@ -14,21 +14,25 @@ is identical to the list except for the LIMIT/OFFSET window.
 """
 from __future__ import annotations
 
-from typing import Optional
+import re
+from typing import Iterator, Optional
 
 from . import ai
 from .db import get_conn
 
 MAX_LIMIT = 200
 DEFAULT_LIMIT = 60
+DEFAULT_SORT = "newest"
 
 # Every order ends with a unique tie-breaker (a.id). Without it, assets sharing
 # a created_at can swap places between two queries and be skipped or repeated
-# when paging. ISO-8601 timestamps sort lexicographically in time order.
+# when paging. julianday() normalises ISO offsets (Z vs +00:00), so two stamps
+# for the same instant tie and fall through to the id tie-breaker instead of
+# sorting by their raw text. An expression index covers this sort (see db.py).
 SORTS = {
-    "newest": "a.created_at DESC, a.id DESC",
-    "oldest": "a.created_at ASC, a.id ASC",
-    "name": "a.title ASC, a.id ASC",
+    "newest": "julianday(a.created_at) DESC, a.id DESC",
+    "oldest": "julianday(a.created_at) ASC, a.id ASC",
+    "name": "a.title COLLATE NOCASE ASC, a.id ASC",
     "largest": "a.size DESC, a.id DESC",
     # Optional: relevance ranking for keyword queries (not used by the UI).
     "relevance": "bm25(asset_fts) ASC, a.id ASC",
@@ -36,7 +40,11 @@ SORTS = {
 
 
 def _fts_query(q: str) -> str:
-    """Turn user text into a safe FTS5 prefix query."""
+    """Turn user text into a safe FTS5 prefix query ('' if nothing usable).
+
+    Punctuation-only input sanitises to no terms; emitting an empty MATCH is a
+    syntax error in FTS5. Returning '' lets callers treat it as no restriction.
+    """
     terms = [t for t in "".join(c if c.isalnum() or c.isspace() else " " for c in q).split() if t]
     return " ".join(f'"{t}"*' for t in terms)
 
@@ -44,8 +52,9 @@ def _fts_query(q: str) -> str:
 def _norm_tags(values) -> list[str]:
     """Lowercase (matching how tags are stored), de-duplicate, drop blanks.
 
-    Accepts a string, a list of strings, or comma-separated strings so both
-    repeated query parameters and a single delimited value work.
+    Accepts a string, a list of strings, or comma-separated strings (both the
+    ASCII comma and the full-width Chinese comma) so repeated query params and
+    a single delimited value both work.
     """
     out: list[str] = []
     if not values:
@@ -55,7 +64,7 @@ def _norm_tags(values) -> list[str]:
     for value in values:
         if value is None:
             continue
-        for part in str(value).split(","):
+        for part in re.split(r"[,，]", str(value)):
             name = part.strip().lower()
             if name and name not in out:
                 out.append(name)
@@ -96,10 +105,11 @@ def _query_parts(
     # every condition by one and made collection filtering match nothing.
     join_params: list = []
 
-    if q and q.strip():
+    fts = _fts_query(q) if q and q.strip() else ""
+    if fts:
         join += " JOIN asset_fts ON asset_fts.rowid = a.id"
         where.append("asset_fts MATCH ?")
-        params.append(_fts_query(q))
+        params.append(fts)
 
     if media_type:
         where.append("a.media_type = ?")
@@ -139,10 +149,10 @@ def _query_parts(
         join += " JOIN collection_assets ca ON ca.asset_id = a.id AND ca.collection_id = ?"
         join_params.append(cid)
 
-    order = SORTS.get(sort, SORTS["newest"])
+    order = SORTS.get(sort, SORTS[DEFAULT_SORT])
     # Relevance only has meaning when an FTS match is part of the query.
-    if order.startswith("bm25") and not (q and q.strip()):
-        order = SORTS["newest"]
+    if order.startswith("bm25") and not fts:
+        order = SORTS[DEFAULT_SORT]
     return join, " AND ".join(where), [*join_params, *params], order
 
 
@@ -194,42 +204,70 @@ def search(
     }
 
 
-def search_all(
-    *,
-    q: str = "",
-    media_type: Optional[str] = None,
-    tag: Optional[str] = None,
-    include_tags=None,
-    exclude_tags=None,
-    collection_id: Optional[int] = None,
-    status: str = "active",
-    sort: str = "newest",
-) -> list[dict]:
-    """The full matching set (no pagination) for CSV export.
+ROW_BATCH = 500  # export reads rows in bounded batches, well under SQLite's var limit
 
-    Uses exactly the same filter/order builder as :func:`search`; only the
-    LIMIT/OFFSET window is dropped. Tags are attached from the live
-    asset_tags table so an edit made through the UI is reflected immediately.
+
+def _tag_names_by_asset(asset_ids: list[int]) -> dict[int, list[str]]:
+    """Fetch tag names for a batch of asset ids, chunked and order-stable."""
+    out: dict[int, list[str]] = {}
+    conn = get_conn()
+    for start in range(0, len(asset_ids), 400):
+        chunk = asset_ids[start:start + 400]
+        marks = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT at.asset_id, t.name FROM asset_tags at JOIN tags t ON t.id = at.tag_id "
+            f"WHERE at.asset_id IN ({marks}) ORDER BY t.name", chunk,
+        ):
+            out.setdefault(row["asset_id"], []).append(row["name"])
+    return out
+
+
+def count_matches(filters: dict) -> int:
+    """Count all matching rows without materialising them."""
+    join, where_sql, params, _ = _query_parts(**filters)
+    return get_conn().execute(
+        f"SELECT COUNT(*) AS c FROM assets a{join} WHERE {where_sql}", params
+    ).fetchone()["c"]
+
+
+def iter_rows(filters: dict, batch_size: int = ROW_BATCH) -> Iterator[dict]:
+    """Yield every matching row in batches (same filters/order as the list).
+
+    This is the export path: it never holds the whole result set in memory.
+    ``filters`` may include ``sort`` (used for ordering) but ``status`` is
+    pinned by the caller. Tags are read live so recent edits are reflected.
     """
     conn = get_conn()
-    join, where_sql, params, order = _query_parts(
+    join, where_sql, params, order = _query_parts(**filters)
+    offset = 0
+    while True:
+        rows = conn.execute(
+            f"SELECT a.* FROM assets a{join} WHERE {where_sql} "
+            f"ORDER BY {order} LIMIT ? OFFSET ?",
+            [*params, batch_size, offset],
+        ).fetchall()
+        if not rows:
+            return
+        tags = _tag_names_by_asset([r["id"] for r in rows])
+        for row in rows:
+            asset = dict(row)
+            asset.pop("embedding", None)
+            asset["tags"] = tags.get(asset["id"], [])
+            yield asset
+        offset += len(rows)
+        if len(rows) < batch_size:
+            return
+
+
+def search_all(*, q: str = "", media_type: Optional[str] = None, tag: Optional[str] = None,
+               include_tags=None, exclude_tags=None, collection_id: Optional[int] = None,
+               status: str = "active", sort: str = "newest") -> list[dict]:
+    """Materialise the full matching set — convenience wrapper over iter_rows."""
+    return list(iter_rows(dict(
         q=q, media_type=media_type, tag=tag, include_tags=include_tags,
         exclude_tags=exclude_tags, collection_id=collection_id,
         status=status, sort=sort,
-    )
-    rows = conn.execute(
-        f"SELECT a.* FROM assets a{join} WHERE {where_sql} ORDER BY {order}", params
-    ).fetchall()
-
-    out = []
-    for row in rows:
-        asset = dict(row)
-        asset.pop("embedding", None)
-        asset["tags"] = [t["name"] for t in conn.execute(
-            "SELECT t.name FROM tags t JOIN asset_tags at ON at.tag_id = t.id "
-            "WHERE at.asset_id = ? ORDER BY t.name", (asset["id"],))]
-        out.append(asset)
-    return out
+    )))
 
 
 def _semantic_search(q, media_type, status, limit, offset) -> dict:

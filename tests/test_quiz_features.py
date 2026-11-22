@@ -221,12 +221,18 @@ def test_equal_created_at_ordering_is_stable(info, client):
 # ---------------------------------------------------------------------------
 # Requirement 3: CSV export
 # ---------------------------------------------------------------------------
+def _export_text(resp):
+    """Decode the CSV body, consuming the UTF-8 BOM (utf-8-sig)."""
+    return resp.content.decode("utf-8-sig")
+
+
 def _export_rows(client, params):
     resp = client.get("/api/assets/export.csv", params=params)
     assert resp.status_code == 200, resp.text
     assert "text/csv" in resp.headers["content-type"]
     assert 'attachment; filename="assets.csv"' in resp.headers["content-disposition"]
-    return list(csv.DictReader(io.StringIO(resp.text)))
+    assert resp.content.startswith(b"\xef\xbb\xbf")  # BOM so spreadsheets open Chinese correctly
+    return list(csv.DictReader(io.StringIO(_export_text(resp))))
 
 
 def test_export_matches_full_filtered_sorted_list(info, client):
@@ -272,7 +278,7 @@ def test_export_zero_results_still_has_header(info, client):
     rows = _export_rows(client, _params(info, q="definitely-no-such-token-xyz"))
     assert rows == []
     resp = client.get("/api/assets/export.csv", params=_params(info, q="definitely-no-such-token-xyz"))
-    assert resp.text.strip() == "uuid,title,description,filename,media_type,tags,created_at"
+    assert _export_text(resp).strip() == "uuid,title,description,filename,media_type,tags,created_at"
 
 
 def test_export_applies_media_type_and_requires_auth(info, client):
@@ -399,5 +405,41 @@ def test_invalid_pagination_and_special_characters(info, client):
     r = client.get("/api/assets", params={**_params(info), "q": '" OR 1=1 --'})
     assert r.status_code == 200  # FTS query is sanitised, no SQL injection
 
-    r = client.get("/api/assets", params={**_params(info), "sort": "bogus"})
-    assert r.status_code == 200  # unknown sort falls back to newest
+    # Pure punctuation sanitises to no FTS terms; treat as unrestricted rather
+    # than issuing an empty MATCH (which FTS5 rejects with a 500).
+    for q in ("!!!", "???", "……”"):
+        r = client.get("/api/assets", params={**_params(info), "q": q})
+        assert r.status_code == 200
+        assert r.json()["total"] >= 8
+
+    # Unsupported options are rejected instead of silently ignored.
+    assert client.get("/api/assets", params={**_params(info), "sort": "bogus"}).status_code == 400
+    assert client.get("/api/assets", params={**_params(info), "mode": "bogus"}).status_code == 400
+    assert client.get("/api/assets", params={**_params(info), "status": "deleted"}).status_code == 400
+    assert client.get("/api/assets", params={**_params(info), "mode": "semantic"}).status_code == 400
+
+
+def test_csv_formula_neutralisation(info, client):
+    """Cells starting with a formula trigger are neutralised in the CSV."""
+    from keepstack.csv_export import neutralise_formula
+    assert neutralise_formula("=HYPERLINK(...)") == "'=HYPERLINK(...)"
+    assert neutralise_formula("+SUM(A1)") == "'+SUM(A1)"
+    assert neutralise_formula("@cmd") == "'@cmd"
+    assert neutralise_formula("-1") == "'-1"
+    assert neutralise_formula("Harbor overview") == "Harbor overview"
+    assert neutralise_formula(None) == ""
+
+
+def test_chinese_comma_tag_separator(info, client):
+    """A full-width Chinese comma also separates tag filter values."""
+    total, _ = _list_all(client, _params(info, include_tags=["approved，campaign"]))
+    assert total == 8
+
+
+def test_timezone_normalised_sort(monkeypatch):
+    """created_at stamps for the same instant sort by id, not raw text."""
+    from keepstack import search
+    # Z and +00:00 are the same instant; julianday() must tie them.
+    join, where, params, order = search._query_parts(sort="oldest")
+    assert "julianday(a.created_at)" in order
+    assert order.rstrip().endswith("a.id ASC")
