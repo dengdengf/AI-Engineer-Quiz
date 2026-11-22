@@ -364,13 +364,18 @@ def test_description_edit_reflects_in_query_and_export(info, client):
 def test_frontend_filter_ui_present():
     html = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
     js = (REPO_ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    helpers = (REPO_ROOT / "web" / "filters.js").read_text(encoding="utf-8")
     for element in ("filter-collection", "filter-include", "filter-exclude",
                     "btn-apply-filter", "btn-clear-filter", "active-filters"):
         assert f'id="{element}"' in html, f"missing UI element: {element}"
     assert "renderActiveFilters" in js          # active conditions are displayed
     assert "#active-filters .fchip" in js        # each condition is removable
     assert "btn-clear-filter" in js              # clear-all wired
-    assert "include_tags" in js and "exclude_tags" in js
+    assert "include_tags" in helpers and "exclude_tags" in helpers
+    assert '<script src="/filters.js"></script>' in html
+    assert "syncUrl" in js and "replaceState" in js  # filter state persisted in URL
+    assert "fromLocationSearch" in js                # and restored on load
+    assert "card-tags" in js                          # cards show why an asset matched
 
 
 def test_frontend_pagination_and_race_guard():

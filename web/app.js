@@ -2,13 +2,21 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const PAGE_SIZE = 12;
+const { splitTags, queryParams, fromLocationSearch } = KeepstackFilters;
 const state = {
   token: localStorage.getItem("keepstack_token"), user: null,
   q: "", media: null, tag: null, sort: "newest",
   collection: "", include: [], exclude: [],
-  offset: 0, total: 0,
+  limit: PAGE_SIZE, offset: 0, total: 0,
   reqSeq: 0, // monotonically increasing id; only the newest request may render
 };
+// Restore a shared/bookmarked view from the URL, then keep it in sync so a
+// refresh or forwarded link reproduces the exact filters, sort and page.
+Object.assign(state, fromLocationSearch(location.search));
+state.limit = PAGE_SIZE;
+function syncUrl() {
+  history.replaceState(null, "", location.pathname + "?" + buildParams().toString());
+}
 
 // ---------- API helper ----------
 async function api(path, opts = {}) {
@@ -46,6 +54,11 @@ function enterApp() {
   $("#user-label").textContent = `${state.user.username} (${state.user.role})`;
   const isAdmin = state.user.role === "admin";
   $$(".admin-only").forEach(el => el.classList.toggle("hidden", !isAdmin));
+  // Reflect the URL-restored state back into the form controls.
+  $("#search").value = state.q;
+  $("#filter-include").value = state.include.join(", ");
+  $("#filter-exclude").value = state.exclude.join(", ");
+  $("#sort").value = state.sort;
   loadCollectionOptions();
   loadLibrary();
 }
@@ -65,22 +78,11 @@ $$(".nav-item").forEach(btn => btn.addEventListener("click", () => {
 
 // ---------- library / search ----------
 let searchTimer;
-const splitTags = (s) => [...new Set((s || "").split(/[,\s]+/).map(t => t.trim().toLowerCase()).filter(Boolean))];
 
 // Build the query string shared by the paged list and the CSV export so both
-// use exactly the same filters and sort.
-function buildParams({ withPage = true } = {}) {
-  const p = new URLSearchParams();
-  p.set("q", state.q);
-  p.set("sort", state.sort);
-  if (state.media) p.set("media_type", state.media);
-  if (state.tag) p.set("tag", state.tag);
-  if (state.collection) p.set("collection_id", state.collection);
-  state.include.forEach(t => p.append("include_tags", t));
-  state.exclude.forEach(t => p.append("exclude_tags", t));
-  if (withPage) { p.set("limit", String(PAGE_SIZE)); p.set("offset", String(state.offset)); }
-  return p;
-}
+// use exactly the same filters and sort. Implemented by the pure, testable
+// web/filters.js helper.
+function buildParams(opts = {}) { return queryParams(state, opts.withPage !== false); }
 
 function resetPage() { state.offset = 0; }
 
@@ -113,6 +115,7 @@ $("#page-next").addEventListener("click", () => {
 async function loadLibrary() {
   const mySeq = ++state.reqSeq;               // tag this request
   const params = buildParams();
+  syncUrl();                                  // URL always reflects the latest view
   try {
     const data = await api("/api/assets?" + params.toString());
     if (mySeq !== state.reqSeq) return;        // a newer request already fired: discard
@@ -143,6 +146,8 @@ function renderGrid(items, total) {
       <div class="meta">
         <span class="title" title="${esc(a.title)}">${esc(a.title)}</span>
         <span class="sub"><span class="badge">${a.media_type}</span><span>${fmtBytes(a.size)}</span></span>
+        <span class="sub"><span>Created</span><span>${esc((a.created_at || "").slice(0, 10))}</span></span>
+        <span class="card-tags">${(a.tags || []).map(t => `<span class="tag mini">${esc(t)}</span>`).join("")}</span>
       </div>
     </div>`).join("");
   $$("#grid .card").forEach(c => c.addEventListener("click", () => openAsset(c.dataset.uuid)));
@@ -151,9 +156,9 @@ function renderGrid(items, total) {
 function renderPager(total) {
   const first = total === 0 ? 0 : state.offset + 1;
   const last = Math.min(state.offset + PAGE_SIZE, total);
-  $("#page-info").textContent = `${first}–${last} of ${total}`;
+  $("#page-info").textContent = total ? `${first}–${last} of ${total}` : "No matches";
   $("#page-prev").disabled = state.offset === 0;
-  $("#page-next").disabled = state.offset + PAGE_SIZE >= total;
+  $("#page-next").disabled = !total || state.offset + PAGE_SIZE >= total;
 }
 
 function renderActiveFilters() {

@@ -187,15 +187,19 @@ def search(
         f"SELECT COUNT(*) AS c FROM assets a{join} WHERE {where_sql}", params
     ).fetchone()["c"]
 
-    rows = conn.execute(
+    rows = [dict(r) for r in conn.execute(
         f"""SELECT a.* FROM assets a{join} WHERE {where_sql}
             ORDER BY {order} LIMIT ? OFFSET ?""",
         [*params, limit, offset],
-    ).fetchall()
+    ).fetchall()]
+    # Attach tags in one batched query so cards can show why an asset matched.
+    tags = _tag_names_by_asset([r["id"] for r in rows]) if rows else {}
+    for r in rows:
+        r["tags"] = tags.get(r["id"], [])
 
     return {
         "total": total,
-        "items": [_card(dict(r)) for r in rows],
+        "items": [_card(r) for r in rows],
         "facets": _facets(status),
         "mode": mode,
         "limit": limit,
@@ -351,4 +355,5 @@ def _card(a: dict) -> dict:
         "alt_text": a["alt_text"],
         "status": a["status"],
         "created_at": a["created_at"],
+        "tags": a.get("tags", []),
     }
